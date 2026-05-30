@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+urls.txt
+menus_lyon.json
+menus_lyon.csv
+nouveauurl.txt
+dashboard.html
+scrape_menus.log
+server_scraper_stdout.log
+
+*.tmp
