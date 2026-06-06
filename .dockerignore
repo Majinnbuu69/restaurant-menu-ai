@@ -1,0 +1,17 @@
+.git
+.env
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+menus_lyon.json
+menus_lyon.csv
+menus_lyon_prix_manquants.csv
+nouveauurl.txt
+dashboard.html
+scrape_menus.log
+server_scraper_stdout.log
+*.tmp
+check_lines.py
+=1.0.0

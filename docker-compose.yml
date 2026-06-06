@@ -1,0 +1,29 @@
+services:
+  menu-dashboard:
+    build: .
+    container_name: menu-scraper
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      # Données persistantes : JSON, CSV, logs, URLs
+      - menu_data:/data
+    environment:
+      # Clés API (à mettre dans un fichier .env sur le VPS, jamais dans le code)
+      - ZYTE_API_KEY=${ZYTE_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # Chemins internes (déjà définis dans le Dockerfile, pas besoin de les changer)
+      - MENU_OUTPUT_PATH=/data/menus.json
+      - MENU_CSV_PATH=/data/menus.csv
+      - MENU_LOG_PATH=/data/scrape_menus.log
+      - MENU_DISCOVERED_PATH=/data/nouveauurl.txt
+      - MENU_URLS_PATH=/data/urls.txt
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8787/api/status')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  menu_data:
