@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 ZYTE_ENDPOINT = "https://api.zyte.com/v1/extract"
 DEFAULT_MODEL = "gpt-4o"
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
 PRICE_PATTERN = re.compile(
     "(?<!\\d)(\\d{1,3}(?:[,.]\\d{1,2})?)\\s*(?:\\u20ac|eur|euros?|euro|EUR|EURS?)\\.?(?![a-zA-Z])|"
     "\\u20ac\\s*(\\d{1,3}(?:[,.]\\d{1,2})?)",
@@ -1223,6 +1223,30 @@ INSTRUCTIONS D'EXTRACTION:
     return system_prompt, user_prompt
 
 
+# Schéma JSON pour Gemini — sans "additionalProperties" (non supporté par l'API Gemini)
+_GEMINI_MENU_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "menu_disponible": {"type": "boolean"},
+        "erreur": {"type": "string", "nullable": True},
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "categorie_plat": {"type": "string"},
+                    "nom_plat": {"type": "string"},
+                    "description": {"type": "string", "nullable": True},
+                    "prix": {"type": "number", "nullable": True},
+                },
+                "required": ["categorie_plat", "nom_plat"],
+            },
+        },
+    },
+    "required": ["menu_disponible", "items"],
+}
+
+
 def parse_menu_with_gemini(
     api_key: str,
     url: str,
@@ -1238,7 +1262,7 @@ def parse_menu_with_gemini(
         config=google_genai_types.GenerateContentConfig(
             system_instruction=system_prompt,
             response_mime_type="application/json",
-            response_schema=AIFlatMenuExtraction,
+            response_schema=_GEMINI_MENU_SCHEMA,
             temperature=0,
         ),
     )
