@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 ZYTE_ENDPOINT = "https://api.zyte.com/v1/extract"
 DEFAULT_MODEL = "gpt-4o"
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-05-20"
 PRICE_PATTERN = re.compile(
     "(?<!\\d)(\\d{1,3}(?:[,.]\\d{1,2})?)\\s*(?:\\u20ac|eur|euros?|euro|EUR|EURS?)\\.?(?![a-zA-Z])|"
     "\\u20ac\\s*(\\d{1,3}(?:[,.]\\d{1,2})?)",
