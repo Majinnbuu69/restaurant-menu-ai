@@ -1,5 +1,0 @@
-# One restaurant URL per line.
-# Copy this file to urls.txt, then replace these examples with your own URLs.
-#
-# https://example-restaurant.com/menu
-# https://example-restaurant.com/carte

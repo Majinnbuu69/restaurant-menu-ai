@@ -1,5 +1,7 @@
 beautifulsoup4>=4.12.3
+google-genai>=1.0.0
 openai>=1.99.0
+pdfplumber>=0.11.0
 pydantic>=2.7.0
 python-dotenv>=1.0.1
 requests>=2.32.3

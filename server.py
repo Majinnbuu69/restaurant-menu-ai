@@ -154,6 +154,10 @@ def build_scraper_command(config: AppConfig, options: dict[str, Any]) -> list[st
     if zyte_geolocation:
         command.extend(["--zyte-geolocation", zyte_geolocation])
 
+    ai_provider = str(options.get("ai_provider", "auto") or "auto").strip()
+    if ai_provider in {"openai", "gemini", "auto"}:
+        command.extend(["--ai-provider", ai_provider])
+
     return command
 
 
@@ -236,6 +240,36 @@ def stop_scraper() -> dict[str, Any]:
         STATE.process = None
 
     return {"ok": True, "message": f"Scraping arrete (pid {pid})."}
+
+
+def reset_data(config: AppConfig, what: list[str]) -> dict[str, Any]:
+    """Supprime les fichiers de données selon la liste 'what'."""
+    if is_running():
+        return {"ok": False, "error": "Arrêtez le scraping avant de reset."}
+
+    deleted = []
+    errors = []
+
+    def _del(path: Path, label: str) -> None:
+        try:
+            if path.exists():
+                path.unlink()
+                deleted.append(label)
+        except OSError as exc:
+            errors.append(f"{label}: {exc}")
+
+    if "results" in what or "all" in what:
+        _del(config.output_path, "JSON")
+        csv_manquants = config.csv_path.with_name(config.csv_path.stem + "_prix_manquants" + config.csv_path.suffix)
+        _del(config.csv_path, "CSV")
+        _del(csv_manquants, "CSV prix manquants")
+    if "logs" in what or "all" in what:
+        _del(config.log_path, "Logs scraper")
+        _del(Path(SERVER_STDOUT_LOG), "Logs serveur")
+    if "discovered" in what or "all" in what:
+        _del(config.discovered_path, "URLs découvertes")
+
+    return {"ok": not errors, "deleted": deleted, "errors": errors}
 
 
 def app_status(config: AppConfig) -> dict[str, Any]:
@@ -741,6 +775,14 @@ def dashboard_html(refresh_ms: int) -> str:
         </div>
         <div class="card-body section-gap">
           <div class="form-grid">
+            <div class="form-field">
+              <label>&#129302; IA</label>
+              <select id="ai_provider" style="width:100%;padding:8px 10px;border:1px solid var(--border2);border-radius:8px;background:var(--surface);color:var(--text);font-size:14px">
+                <option value="auto">Auto (OpenAI → Gemini)</option>
+                <option value="gemini">Gemini uniquement</option>
+                <option value="openai">OpenAI uniquement</option>
+              </select>
+            </div>
             <div class="form-field"><label>Workers</label><input id="workers" type="number" min="1" max="12" value="3"></div>
             <div class="form-field"><label>Pages menu max</label><input id="max_menu_pages" type="number" min="1" max="10" value="4"></div>
             <div class="form-field"><label>Zyte retries</label><input id="zyte_retries" type="number" min="0" max="10" value="3"></div>
@@ -774,6 +816,7 @@ def dashboard_html(refresh_ms: int) -> str:
             <button id="start" class="btn btn-primary">&#9654; Lancer</button>
             <button id="abort" class="btn btn-danger" disabled>&#9632; Arreter</button>
             <button id="restart" class="btn btn-warning">&#8635; Restart</button>
+            <button id="resetAll" class="btn" style="background:var(--surface2);color:var(--text2);border:1px solid var(--border2)" title="Remet a zero les resultats, logs et stats">&#128465; Reset tout</button>
           </div>
         </div>
       </div>
@@ -828,8 +871,10 @@ def dashboard_html(refresh_ms: int) -> str:
 <script>
 const refreshMs = {refresh_ms};
 const FIELDS = ['workers','max_menu_pages','zyte_retries','zyte_timeout','openai_timeout','sleep','zyte_ip_type','zyte_geolocation'];
+const SELECTS = ['ai_provider'];
 const CHECKS = ['retry_failed','retry_incomplete','overwrite','keep_duplicates','no_interactive_expand','no_network_capture'];
 const DEFAULTS = {{ workers:'3', max_menu_pages:'4', zyte_retries:'3', zyte_timeout:'60', openai_timeout:'90', sleep:'0.2', zyte_ip_type:'', zyte_geolocation:'FR' }};
+const DEFAULTS_SELECTS = {{ ai_provider:'auto' }};
 const DEFAULTS_CHECKS = {{ retry_failed:true, retry_incomplete:true, overwrite:false, keep_duplicates:false, no_interactive_expand:false, no_network_capture:false }};
 
 // === THEME ===
@@ -860,6 +905,7 @@ function toast(message, type = 'info') {{
 function saveOptions() {{
   const data = {{}};
   for (const id of FIELDS) data[id] = document.getElementById(id).value;
+  for (const id of SELECTS) data[id] = document.getElementById(id).value;
   for (const id of CHECKS) data[id] = document.getElementById(id).checked;
   localStorage.setItem('scraper_options', JSON.stringify(data));
 }}
@@ -869,17 +915,19 @@ function loadOptions() {{
   try {{
     const data = JSON.parse(raw);
     for (const id of FIELDS) if (data[id] !== undefined) document.getElementById(id).value = data[id];
+    for (const id of SELECTS) if (data[id] !== undefined) document.getElementById(id).value = data[id];
     for (const id of CHECKS) if (data[id] !== undefined) document.getElementById(id).checked = data[id];
   }} catch(e) {{}}
 }}
 function resetOptions() {{
   for (const [id, val] of Object.entries(DEFAULTS)) document.getElementById(id).value = val;
+  for (const [id, val] of Object.entries(DEFAULTS_SELECTS)) document.getElementById(id).value = val;
   for (const [id, val] of Object.entries(DEFAULTS_CHECKS)) document.getElementById(id).checked = val;
   localStorage.removeItem('scraper_options');
   toast('Options remises par defaut', 'info');
 }}
 loadOptions();
-[...FIELDS, ...CHECKS].forEach(id => {{
+[...FIELDS, ...SELECTS, ...CHECKS].forEach(id => {{
   document.getElementById(id).addEventListener('change', saveOptions);
 }});
 document.getElementById('resetOptions').addEventListener('click', resetOptions);
@@ -889,6 +937,7 @@ function setText(id, value) {{ document.getElementById(id).textContent = value; 
 function getOptions() {{
   const data = {{}};
   for (const id of FIELDS) data[id] = document.getElementById(id).value;
+  for (const id of SELECTS) data[id] = document.getElementById(id).value;
   for (const id of CHECKS) data[id] = document.getElementById(id).checked;
   return data;
 }}
@@ -1031,7 +1080,22 @@ document.getElementById('restart').addEventListener('click', async () => {{
 
 document.getElementById('clearLogs').addEventListener('click', () => {{
   document.getElementById('logs').innerHTML = '';
-  lastLogCount = -1;
+  lastLogLine = '';
+}});
+
+document.getElementById('resetAll').addEventListener('click', async () => {{
+  if (!confirm('Supprimer tous les resultats, CSV, logs et stats ? Cette action est irreversible.')) return;
+  try {{
+    const body = await postJson('/api/reset', {{ what: ['all'] }});
+    if (body.ok) {{
+      toast('Reset effectue: ' + (body.deleted || []).join(', '), 'success');
+    }} else {{
+      toast('Reset partiel: ' + (body.errors || []).join(', '), 'error');
+    }}
+    lastLogLine = '';
+    document.getElementById('logs').innerHTML = '';
+    await loadStatus();
+  }} catch(e) {{ toast(e.message, 'error'); }}
 }});
 
 // === INIT ===
@@ -1109,6 +1173,10 @@ def make_handler(config: AppConfig):
                     stop_scraper()
                     result = start_scraper(config, data)
                     self.send_json(result, 200 if result.get("ok") else 409)
+                    return
+                if parsed.path == "/api/reset":
+                    what = data.get("what", ["all"])
+                    self.send_json(reset_data(config, what))
                     return
                 self.send_json({"ok": False, "error": "Not found"}, 404)
             except Exception as exc:

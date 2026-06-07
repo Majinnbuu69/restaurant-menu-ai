@@ -19,12 +19,15 @@ from urllib.parse import urldefrag, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from google import genai as google_genai
+from google.genai import types as google_genai_types
 from openai import APIError, APITimeoutError, OpenAI, OpenAIError, RateLimitError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 ZYTE_ENDPOINT = "https://api.zyte.com/v1/extract"
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-4o"
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 PRICE_PATTERN = re.compile(
     "(?<!\\d)(\\d{1,3}(?:[,.]\\d{1,2})?)\\s*(?:\\u20ac|eur|euros?|euro|EUR|EURS?)\\.?(?![a-zA-Z])|"
     "\\u20ac\\s*(\\d{1,3}(?:[,.]\\d{1,2})?)",
@@ -144,6 +147,7 @@ class MenuLinkCandidate:
     url: str
     text: str
     score: int
+    is_media: bool = False  # True si PDF ou image (OCR nécessaire)
 
 
 @dataclass
@@ -658,7 +662,6 @@ def remove_noise_nodes(soup: BeautifulSoup) -> None:
             "noscript",
             "svg",
             "canvas",
-            "header",
             "footer",
             "aside",
         ]
@@ -784,8 +787,7 @@ def score_menu_link(text: str, href: str, base_url: str) -> int:
     path = parsed_href.path.casefold()
     if path in {"", "/"}:
         score -= 3
-    if looks_like_unsupported_resource(href):
-        score -= 5
+    # Ne pénalise plus les PDFs/images : on les gère via OCR
     if href.rstrip("/") == base_url.rstrip("/"):
         score -= 5
 
@@ -808,7 +810,11 @@ def discover_menu_links(html: str, base_url: str, limit: int) -> list[MenuLinkCa
 
         text = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True))
         score = score_menu_link(text, absolute_url, base_url)
-        if score < 4:
+        is_media = looks_like_unsupported_resource(absolute_url)
+
+        # Les PDF/images doivent avoir un score plus fort pour être inclus
+        min_score = 6 if is_media else 4
+        if score < min_score:
             continue
 
         existing = candidates_by_url.get(absolute_url)
@@ -817,6 +823,7 @@ def discover_menu_links(html: str, base_url: str, limit: int) -> list[MenuLinkCa
                 url=absolute_url,
                 text=text[:120],
                 score=score,
+                is_media=is_media,
             )
 
     return sorted(candidates_by_url.values(), key=lambda item: item.score, reverse=True)[:limit]
@@ -842,6 +849,131 @@ def combine_page_texts(page_texts: list[tuple[str, str]], max_chars: int) -> str
     return trim_text_for_llm(combined.splitlines(), max_chars=max_chars)
 
 
+def _extract_pdf_text_pdfplumber(content: bytes) -> str:
+    """Extrait le texte d'un PDF avec pdfplumber. Retourne '' si pas de texte (PDF scanné)."""
+    try:
+        import io
+        import pdfplumber  # type: ignore[import]
+
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            parts: list[str] = []
+            for page in pdf.pages[:10]:
+                text = page.extract_text()
+                if text:
+                    parts.append(text)
+            return "\n\n".join(parts)
+    except Exception as exc:
+        logging.debug("pdfplumber echec: %s", exc)
+        return ""
+
+
+def _ocr_with_vision(
+    content: bytes,
+    mime_type: str,
+    source_url: str,
+    openai_client: Optional[OpenAI],
+    gemini_api_key: Optional[str],
+    gemini_model: str,
+) -> str:
+    """
+    Envoie un document (image ou PDF scanné) à un LLM vision pour en extraire le texte du menu.
+    Essaie Gemini d'abord (supporte PDF natif), puis GPT-4o vision pour les images.
+    """
+    ocr_prompt = (
+        "Ce document est le menu d'un restaurant. "
+        "Extrait tout le texte visible: noms des plats, categories, descriptions, prix. "
+        "Retourne uniquement le texte brut structure par section."
+    )
+    b64 = base64.b64encode(content).decode("ascii")
+
+    # Gemini supporte PDF et images nativement
+    if gemini_api_key:
+        try:
+            client = google_genai.Client(api_key=gemini_api_key)
+            response = client.models.generate_content(
+                model=gemini_model,
+                contents=[
+                    google_genai_types.Part.from_bytes(data=content, mime_type=mime_type),
+                    ocr_prompt,
+                ],
+            )
+            text = response.text or ""
+            if text.strip():
+                logging.info("OCR Gemini reussi pour %s (%s chars)", source_url, len(text))
+                return text[:42000]
+        except Exception as exc:
+            logging.warning("OCR Gemini echec pour %s: %s", source_url, exc)
+
+    # GPT-4o vision pour les images (pas de support PDF natif)
+    if openai_client and mime_type.startswith("image/"):
+        try:
+            response = openai_client.responses.create(
+                model="gpt-4o",
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": ocr_prompt},
+                        {"type": "input_image", "image_url": f"data:{mime_type};base64,{b64}"},
+                    ],
+                }],
+            )
+            text = response.output_text or ""
+            if text.strip():
+                logging.info("OCR GPT-4o reussi pour %s (%s chars)", source_url, len(text))
+                return text[:42000]
+        except Exception as exc:
+            logging.warning("OCR GPT-4o echec pour %s: %s", source_url, exc)
+
+    return ""
+
+
+def fetch_pdf_or_image_text(
+    url: str,
+    openai_client: Optional[OpenAI],
+    gemini_api_key: Optional[str],
+    gemini_model: str = DEFAULT_GEMINI_MODEL,
+    timeout: int = 30,
+) -> str:
+    """
+    Télécharge un PDF ou une image et extrait le texte via OCR.
+    - PDF avec texte → pdfplumber
+    - PDF scanné / image → vision IA (Gemini ou GPT-4o)
+    Retourne le texte extrait, ou '' en cas d'échec.
+    """
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MenuScraper/1.0)"},
+            stream=True,
+        )
+        resp.raise_for_status()
+        content = resp.content
+        content_type = resp.headers.get("content-type", "").lower().split(";")[0].strip()
+    except Exception as exc:
+        logging.warning("Impossible de telecharger %s: %s", url, exc)
+        return ""
+
+    ext = Path(urlparse(url).path).suffix.lower()
+    is_pdf = ext == ".pdf" or content_type == "application/pdf"
+    is_image = ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic"} \
+        or content_type.startswith("image/")
+
+    if is_pdf:
+        text = _extract_pdf_text_pdfplumber(content)
+        if text.strip():
+            logging.info("PDF texte extrait (pdfplumber) depuis %s (%s chars)", url, len(text))
+            return text[:42000]
+        logging.info("PDF scanné détecté, bascule sur vision IA: %s", url)
+        return _ocr_with_vision(content, "application/pdf", url, openai_client, gemini_api_key, gemini_model)
+
+    if is_image:
+        mime = content_type if content_type.startswith("image/") else f"image/{ext.lstrip('.')}"
+        return _ocr_with_vision(content, mime, url, openai_client, gemini_api_key, gemini_model)
+
+    return ""
+
+
 def collect_visible_text_for_restaurant(
     session: requests.Session,
     url: str,
@@ -854,6 +986,9 @@ def collect_visible_text_for_restaurant(
     max_menu_pages: int,
     expand_interactive: bool,
     capture_network: bool,
+    openai_client: Optional[OpenAI] = None,
+    gemini_api_key: Optional[str] = None,
+    gemini_model: str = DEFAULT_GEMINI_MODEL,
 ) -> tuple[str, list[str]]:
     fetched_urls: list[str] = []
     page_texts: list[tuple[str, str]] = []
@@ -877,29 +1012,56 @@ def collect_visible_text_for_restaurant(
     page_texts.append((first_page.final_url, first_text))
     fetched_urls.append(first_page.final_url)
 
+    # Découverte des liens menu : on inclut plus de candidats pour gérer PDF/images
     candidates = discover_menu_links(
         first_page.html,
         first_page.final_url,
-        limit=max(0, max_menu_pages - 1),
+        limit=max(0, max_menu_pages * 2 - 1),  # double pour avoir du choix
     )
 
     if candidates:
         logging.info(
             "Liens menu detectes pour %s: %s",
             domain_for_log(url),
-            ", ".join(f"{candidate.text or candidate.url} ({candidate.score})" for candidate in candidates[:3]),
+            ", ".join(
+                f"{'[PDF/IMG] ' if c.is_media else ''}{c.text or c.url} (score={c.score})"
+                for c in candidates[:5]
+            ),
         )
 
     seen_urls = {first_page.final_url.rstrip("/"), url.rstrip("/")}
+    html_pages_added = 0
+    media_pages_added = 0
+
     for candidate in candidates:
-        if len(page_texts) >= max_menu_pages:
+        if html_pages_added + media_pages_added >= max_menu_pages - 1:
             break
         if candidate.url.rstrip("/") in seen_urls:
             continue
-        if looks_like_unsupported_resource(candidate.url):
-            logging.info("Lien menu ignore car PDF/image: %s", candidate.url)
+
+        seen_urls.add(candidate.url.rstrip("/"))
+
+        if candidate.is_media:
+            # PDF ou image : OCR via vision IA
+            if not (openai_client or gemini_api_key):
+                logging.info("OCR ignoré (aucune clé IA): %s", candidate.url)
+                continue
+            logging.info("OCR PDF/image en cours: %s", candidate.url)
+            ocr_text = fetch_pdf_or_image_text(
+                url=candidate.url,
+                openai_client=openai_client,
+                gemini_api_key=gemini_api_key,
+                gemini_model=gemini_model,
+            )
+            if ocr_text.strip():
+                page_texts.append((candidate.url, f"[OCR] {ocr_text}"))
+                fetched_urls.append(candidate.url)
+                media_pages_added += 1
+            else:
+                logging.warning("OCR vide pour %s", candidate.url)
             continue
 
+        # Lien HTML classique
         try:
             candidate_page = fetch_html_with_zyte(
                 session=session,
@@ -921,16 +1083,17 @@ def collect_visible_text_for_restaurant(
             candidate_text = f"{candidate_text}\n\n{candidate_page.network_text}"
 
         density = menu_density_score(candidate_text)
-        if density < 5:
-            logging.info(
-                "Lien menu garde malgre score faible (%s): %s",
-                density,
-                candidate.url,
-            )
+        logging.info(
+            "Page menu ajoutee %s (score densité=%s): %s",
+            len(page_texts) + 1,
+            density,
+            candidate.url,
+        )
 
         page_texts.append((candidate_page.final_url, candidate_text))
         fetched_urls.append(candidate_page.final_url)
         seen_urls.add(candidate_page.final_url.rstrip("/"))
+        html_pages_added += 1
 
     return combine_page_texts(page_texts, max_chars=max_chars), fetched_urls
 
@@ -942,43 +1105,55 @@ def parse_menu_with_openai(
     model: str,
 ) -> AIFlatMenuExtraction:
     system_prompt = (
-        "Tu es un expert en extraction de menus de restaurants depuis du texte HTML nettoye. "
-        "Tu retournes uniquement des donnees conformes au schema structure. "
-        "Tu n'inventes jamais un plat, un prix, une categorie ou des ingredients."
+        "Tu es un expert en extraction structuree de menus de restaurants a partir de texte brut issu de pages web. "
+        "Ta priorite absolue est d'extraire TOUS les plats visibles, meme ceux sans prix. "
+        "Tu ne rates aucun plat, aucune categorie, aucune section du menu. "
+        "Tu n'inventes rien : ni plat, ni prix, ni description qui n'apparait pas dans le texte. "
+        "Tu retournes toujours un JSON strictement conforme au schema demande."
     )
 
-    user_prompt = f"""
-Analyse la page de ce restaurant et extrait le menu sous forme de JSON structure.
+    user_prompt = f"""Analyse ce texte extrait d'un site de restaurant et extrait l'integralite du menu.
 
-URL source: {url}
+URL: {url}
 
-Texte visible extrait du site:
+TEXTE EXTRAIT:
 ---
 {visible_text}
 ---
 
-Format attendu:
-- menu_disponible=true si un menu exploitable est present.
-- items doit etre un tableau d'objets avec exactement:
-  categorie_plat: categorie du plat, ex: Entrees, Burgers, Desserts.
-  nom_plat: nom exact du plat.
-  description: ingredients ou description, null si absent.
-  prix: uniquement le nombre du prix en euros, ex: 12.50. Null si absent ou ambigu.
-- Si la page ne contient pas de menu, si le lien est mort, si c'est un PDF/image,
-  ou si le menu n'est pas exploitable: menu_disponible=false, items=[], erreur explicite.
+INSTRUCTIONS D'EXTRACTION:
 
-Regles strictes:
-- Ignore horaires, adresses, telephone, avis clients, reseaux sociaux, navigation,
-  mentions legales et textes marketing.
-- Conserve la langue originale des categories et plats.
-- Convertis "12,50 EUR" ou "12,50€" en 12.50.
-- Ne mets jamais 0 ou 0.0 pour un prix manquant. Utilise null.
-- Si un prix commun s'applique a toute une categorie ou un groupe visible de plats,
-  applique ce prix a chaque plat du groupe.
-- Si un plat a plusieurs tailles/formules avec prix distincts, cree un item par variante
-  et indique la variante dans nom_plat.
-- N'inclus pas les supplements seuls comme plats principaux, sauf s'ils sont clairement
-  vendus comme articles de menu.
+1. menu_disponible = true si au moins un plat ou une carte est identifiable dans le texte.
+   menu_disponible = false uniquement si le texte ne contient clairement aucune information de menu.
+
+2. Pour chaque plat trouve, cree un item avec:
+   - categorie_plat: la section/categorie du menu (ex: "Entrees", "Pizzas", "Burgers", "Desserts", "Boissons", "Formules").
+     Si aucune categorie n'est explicite, utilise "Menu".
+   - nom_plat: le nom exact tel qu'il apparait dans le texte. Ne traduis pas, ne modifie pas.
+   - description: les ingredients ou la description courte si presente, sinon null.
+   - prix: le prix en euros sous forme de nombre decimal (ex: 12.50). null si le prix n'est pas clairement indique.
+
+3. REGLES DE PRIX:
+   - Convertis toujours: "12,50€" → 12.50 | "12.5 EUR" → 12.50 | "12€50" → 12.50
+   - Si un prix unique s'applique a tous les plats d'une section, mets ce prix sur chaque plat.
+   - Si un plat a plusieurs tailles avec des prix differents (ex: petite/grande), cree un item par taille.
+   - Ne mets JAMAIS 0. Si le prix est ambigu ou absent, mets null.
+
+4. INCLURE meme si:
+   - Le plat n'a pas de prix → met null pour prix
+   - La description est absente → met null pour description
+   - Le plat est dans une formule → extrait chaque element de formule comme item avec la categorie "Formule"
+
+5. IGNORER:
+   - Horaires, adresses, numeros de telephone
+   - Avis clients, notes, commentaires
+   - Liens de navigation, boutons, menus de site
+   - Mentions legales, CGV, politique de confidentialite
+   - Publicites et textes promotionnels sans nom de plat
+
+6. Si le texte contient plusieurs sections de menu (ex: plusieurs pages concatenees), extrait tout.
+
+7. Si menu_disponible=false, explique pourquoi dans le champ erreur (ex: "Page institutionnelle sans menu", "Lien mort", "Contenu non lisible").
 """.strip()
 
     response = client.responses.parse(
@@ -996,6 +1171,152 @@ Regles strictes:
         raise OpenAIError("OpenAI n'a pas retourne de sortie structuree parsable")
 
     return parsed
+
+
+def _build_ai_prompts(url: str, visible_text: str) -> tuple[str, str]:
+    """Retourne (system_prompt, user_prompt) partages entre OpenAI et Gemini."""
+    system_prompt = (
+        "Tu es un expert en extraction structuree de menus de restaurants a partir de texte brut issu de pages web. "
+        "Ta priorite absolue est d'extraire TOUS les plats visibles, meme ceux sans prix. "
+        "Tu ne rates aucun plat, aucune categorie, aucune section du menu. "
+        "Tu n'inventes rien : ni plat, ni prix, ni description qui n'apparait pas dans le texte. "
+        "Tu retournes toujours un JSON strictement conforme au schema demande."
+    )
+    user_prompt = f"""Analyse ce texte extrait d'un site de restaurant et extrait l'integralite du menu.
+
+URL: {url}
+
+TEXTE EXTRAIT:
+---
+{visible_text}
+---
+
+INSTRUCTIONS D'EXTRACTION:
+
+1. menu_disponible = true si au moins un plat ou une carte est identifiable dans le texte.
+   menu_disponible = false uniquement si le texte ne contient clairement aucune information de menu.
+
+2. Pour chaque plat trouve, cree un item avec:
+   - categorie_plat: la section/categorie du menu (ex: "Entrees", "Pizzas", "Burgers", "Desserts", "Boissons", "Formules").
+     Si aucune categorie n'est explicite, utilise "Menu".
+   - nom_plat: le nom exact tel qu'il apparait dans le texte. Ne traduis pas, ne modifie pas.
+   - description: les ingredients ou la description courte si presente, sinon null.
+   - prix: le prix en euros sous forme de nombre decimal (ex: 12.50). null si le prix n'est pas clairement indique.
+
+3. REGLES DE PRIX:
+   - Convertis toujours: "12,50 EUR" -> 12.50 | "12.5 EUR" -> 12.50 | "12€50" -> 12.50
+   - Si un prix unique s'applique a tous les plats d'une section, mets ce prix sur chaque plat.
+   - Si un plat a plusieurs tailles avec des prix differents, cree un item par taille.
+   - Ne mets JAMAIS 0. Si le prix est ambigu ou absent, mets null.
+
+4. INCLURE meme si:
+   - Le plat n'a pas de prix -> met null pour prix
+   - La description est absente -> met null pour description
+   - Le plat est dans une formule -> extrait chaque element avec la categorie "Formule"
+
+5. IGNORER: horaires, adresses, telephone, avis clients, navigation, mentions legales, CGV.
+
+6. Si le texte contient plusieurs sections de menu, extrait tout.
+
+7. Si menu_disponible=false, explique pourquoi dans le champ erreur.
+""".strip()
+    return system_prompt, user_prompt
+
+
+def parse_menu_with_gemini(
+    api_key: str,
+    url: str,
+    visible_text: str,
+    timeout: int,
+    model: str = DEFAULT_GEMINI_MODEL,
+) -> AIFlatMenuExtraction:
+    system_prompt, user_prompt = _build_ai_prompts(url, visible_text)
+    client = google_genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model,
+        contents=user_prompt,
+        config=google_genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=AIFlatMenuExtraction,
+            temperature=0,
+        ),
+    )
+    if not response.text:
+        raise ValueError("Gemini n'a retourne aucun contenu JSON.")
+    try:
+        return AIFlatMenuExtraction.model_validate_json(response.text)
+    except (ValidationError, ValueError) as exc:
+        raise ValueError(f"Gemini: reponse JSON invalide: {exc}") from exc
+
+
+def _is_openai_quota_or_timeout(exc: Exception) -> bool:
+    """Retourne True si l'erreur OpenAI justifie un basculement vers Gemini."""
+    if isinstance(exc, (APITimeoutError, RateLimitError)):
+        return True
+    # APIError générique avec status 429 (insufficient_quota, etc.)
+    if isinstance(exc, APIError) and getattr(exc, "status_code", None) == 429:
+        return True
+    return False
+
+
+def parse_menu_with_ai(
+    openai_client: OpenAI,
+    url: str,
+    visible_text: str,
+    openai_model: str,
+    gemini_api_key: Optional[str],
+    gemini_model: str,
+    gemini_timeout: int,
+    ai_provider: str = "auto",
+) -> AIFlatMenuExtraction:
+    """
+    Orchestre les appels IA selon ai_provider :
+      - "openai"  : OpenAI uniquement, pas de fallback
+      - "gemini"  : Gemini uniquement, pas d'OpenAI
+      - "auto"    : OpenAI d'abord, bascule Gemini si quota/timeout, retry OpenAI en dernier recours
+    """
+    host = domain_for_log(url)
+
+    # --- Mode Gemini uniquement ---
+    if ai_provider == "gemini":
+        if not gemini_api_key:
+            raise ValueError("ai_provider=gemini mais GEMINI_API_KEY non configuree.")
+        logging.info("IA: Gemini uniquement pour %s", host)
+        return parse_menu_with_gemini(gemini_api_key, url, visible_text, gemini_timeout, gemini_model)
+
+    # --- Mode OpenAI uniquement ---
+    if ai_provider == "openai":
+        logging.info("IA: OpenAI uniquement pour %s", host)
+        return parse_menu_with_openai(openai_client, url, visible_text, openai_model)
+
+    # --- Mode auto (OpenAI → Gemini fallback) ---
+    try:
+        return parse_menu_with_openai(openai_client, url, visible_text, openai_model)
+    except Exception as openai_exc:
+        if not _is_openai_quota_or_timeout(openai_exc):
+            raise
+
+        if not gemini_api_key:
+            logging.error(
+                "OpenAI quota depasse pour %s MAIS GEMINI_API_KEY non configuree. "
+                "Ajoutez GEMINI_API_KEY ou choisissez ai_provider=gemini.",
+                host,
+            )
+            raise
+
+        logging.warning(
+            "OpenAI indisponible pour %s (code=%s) — bascule sur Gemini",
+            host,
+            getattr(openai_exc, "status_code", "?"),
+        )
+        try:
+            result = parse_menu_with_gemini(gemini_api_key, url, visible_text, gemini_timeout, gemini_model)
+            logging.info("Gemini a pris le relais avec succes pour %s", host)
+            return result
+        except Exception as gemini_exc:
+            logging.warning("Gemini a aussi echoue pour %s (%s) — retry OpenAI", host, gemini_exc)
+            return parse_menu_with_openai(openai_client, url, visible_text, openai_model)
 
 
 def parse_price_value(raw_price: str) -> Optional[float]:
@@ -1082,16 +1403,14 @@ def normalize_result(menu: AIFlatMenuExtraction, url: str, visible_text: str) ->
         if not dish_name:
             continue
 
-        price = item.prix
-        if price is None or price <= 0:
+        # Tente de trouver un prix fiable, mais garde le plat meme sans prix
+        price = item.prix if item.prix and item.prix > 0 else None
+        if price is None:
             price = find_price_near_name(visible_text, dish_name)
-        if price is None or price <= 0:
-            shared_category_price = find_shared_category_price(visible_text, category_name)
-            if shared_category_price is not None:
-                price = shared_category_price
-        if price is None or price <= 0:
-            logging.debug("Plat ignore sans prix fiable: %s (%s)", dish_name, url)
-            continue
+        if price is None:
+            price = find_shared_category_price(visible_text, category_name)
+        if price is not None and price <= 0:
+            price = None
 
         if category_name not in categories_by_name:
             categories_by_name[category_name] = []
@@ -1101,7 +1420,7 @@ def normalize_result(menu: AIFlatMenuExtraction, url: str, visible_text: str) ->
             {
                 "nom_plat": dish_name,
                 "description_ingredients": item.description.strip() if item.description else None,
-                "prix_euros": round(float(price), 2),
+                "prix_euros": round(float(price), 2) if price is not None else None,
             }
         )
 
@@ -1114,7 +1433,7 @@ def normalize_result(menu: AIFlatMenuExtraction, url: str, visible_text: str) ->
     if not categories:
         return error_result(
             url,
-            menu.erreur or "Menu detecte, mais aucun plat avec prix fiable n'a pu etre extrait.",
+            menu.erreur or "Menu detecte, mais aucun plat n'a pu etre extrait.",
         )
 
     return {
@@ -1140,6 +1459,10 @@ def process_url(
     max_menu_pages: int,
     expand_interactive: bool,
     capture_network: bool,
+    gemini_api_key: Optional[str] = None,
+    gemini_model: str = DEFAULT_GEMINI_MODEL,
+    gemini_timeout: int = 60,
+    ai_provider: str = "auto",
 ) -> ProcessOutcome:
     host = domain_for_log(url)
 
@@ -1161,6 +1484,9 @@ def process_url(
             max_menu_pages=max_menu_pages,
             expand_interactive=expand_interactive,
             capture_network=capture_network,
+            openai_client=openai_client,
+            gemini_api_key=gemini_api_key,
+            gemini_model=gemini_model,
         )
         if len(visible_text) < 80:
             logging.warning("[%s/%s] Texte insuffisant pour %s", index, total, host)
@@ -1175,11 +1501,15 @@ def process_url(
             len(visible_text),
         )
 
-        menu = parse_menu_with_openai(
-            client=openai_client,
+        menu = parse_menu_with_ai(
+            openai_client=openai_client,
             url=url,
             visible_text=visible_text,
-            model=model,
+            openai_model=model,
+            gemini_api_key=gemini_api_key,
+            gemini_model=gemini_model,
+            gemini_timeout=gemini_timeout,
+            ai_provider=ai_provider,
         )
         result = normalize_result(menu, url=url, visible_text=visible_text)
         if not result["menu_disponible"] and result.get("erreur"):
@@ -1242,6 +1572,7 @@ def process_url_job(
     args: argparse.Namespace,
     zyte_api_key: str,
     openai_api_key: str,
+    gemini_api_key: Optional[str] = None,
 ) -> ProcessOutcome:
     session = requests.Session()
     openai_client = OpenAI(
@@ -1267,6 +1598,10 @@ def process_url_job(
             max_menu_pages=args.max_menu_pages,
             expand_interactive=not args.no_interactive_expand,
             capture_network=not args.no_network_capture,
+            gemini_api_key=gemini_api_key,
+            gemini_model=getattr(args, "gemini_model", DEFAULT_GEMINI_MODEL),
+            gemini_timeout=getattr(args, "gemini_timeout", 60),
+            ai_provider=getattr(args, "ai_provider", "auto"),
         )
     finally:
         session.close()
@@ -1326,39 +1661,64 @@ def count_dishes(result: dict) -> int:
     )
 
 
-def save_flat_csv(path: Path, results: list[dict]) -> None:
-    if not path:
-        return
+_CSV_FIELDNAMES = [
+    "url_restaurant",
+    "nom_categorie",
+    "nom_plat",
+    "description_ingredients",
+    "prix_euros",
+]
 
+
+def _write_csv_rows_atomic(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "url_restaurant",
-                "nom_categorie",
-                "nom_plat",
-                "description_ingredients",
-                "prix_euros",
-            ],
-        )
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDNAMES)
         writer.writeheader()
-        for result in results:
-            if not result.get("menu_disponible"):
-                continue
-            for category in result.get("categories", []) or []:
-                for dish in category.get("plats", []) or []:
-                    writer.writerow(
-                        {
-                            "url_restaurant": result.get("url_restaurant", ""),
-                            "nom_categorie": category.get("nom_categorie", ""),
-                            "nom_plat": dish.get("nom_plat", ""),
-                            "description_ingredients": dish.get("description_ingredients") or "",
-                            "prix_euros": dish.get("prix_euros", ""),
-                        }
-                    )
+        writer.writerows(rows)
     tmp_path.replace(path)
+
+
+def save_flat_csv(path: Path, results: list[dict]) -> None:
+    """
+    Génère deux CSV automatiquement :
+    - <path>               : tous les plats (avec et sans prix)
+    - <path stem>_prix_manquants.csv : uniquement les plats sans prix
+    """
+    if not path:
+        return
+
+    all_rows: list[dict] = []
+    for result in results:
+        if not result.get("menu_disponible"):
+            continue
+        for category in result.get("categories", []) or []:
+            for dish in category.get("plats", []) or []:
+                prix = dish.get("prix_euros")
+                all_rows.append(
+                    {
+                        "url_restaurant": result.get("url_restaurant", ""),
+                        "nom_categorie": category.get("nom_categorie", ""),
+                        "nom_plat": dish.get("nom_plat", ""),
+                        "description_ingredients": dish.get("description_ingredients") or "",
+                        "prix_euros": prix if prix is not None else "",
+                    }
+                )
+
+    _write_csv_rows_atomic(path, all_rows)
+    logging.info("CSV complet: %s plats -> %s", len(all_rows), path)
+
+    # CSV secondaire : plats sans prix (pour revue manuelle)
+    sans_prix = [row for row in all_rows if row["prix_euros"] == ""]
+    if sans_prix:
+        sans_prix_path = path.with_name(path.stem + "_prix_manquants" + path.suffix)
+        _write_csv_rows_atomic(sans_prix_path, sans_prix)
+        logging.info(
+            "CSV prix manquants: %s plats sans prix -> %s",
+            len(sans_prix),
+            sans_prix_path,
+        )
 
 
 def read_log_tail(log_file: Optional[str], max_lines: int = 80) -> list[str]:
@@ -1476,8 +1836,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--urls", default="urls.txt", help="Fichier contenant une URL par ligne.")
     parser.add_argument("--output", default="menus_lyon.json", help="Fichier JSON de sortie.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Modele OpenAI a utiliser.")
-    parser.add_argument("--max-chars", type=int, default=30000, help="Texte max envoye a OpenAI.")
-    parser.add_argument("--max-menu-pages", type=int, default=3, help="Pages menu candidates a crawler par URL.")
+    parser.add_argument(
+        "--ai-provider",
+        choices=["auto", "openai", "gemini"],
+        default="auto",
+        help="IA a utiliser: auto (OpenAI avec fallback Gemini), openai, ou gemini.",
+    )
+    parser.add_argument("--max-chars", type=int, default=42000, help="Texte max envoye a OpenAI.")
+    parser.add_argument("--max-menu-pages", type=int, default=6, help="Pages menu candidates a crawler par URL (inclut PDF/images).")
     parser.add_argument("--zyte-timeout", type=int, default=90, help="Timeout Zyte en secondes.")
     parser.add_argument("--zyte-retries", type=int, default=3, help="Retries Zyte pour bans/rate limits.")
     parser.add_argument(
@@ -1537,6 +1903,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reprocess les menus deja sauvegardes qui contiennent des prix a 0 ou aucun plat.",
     )
+    parser.add_argument(
+        "--gemini-model",
+        default=DEFAULT_GEMINI_MODEL,
+        help="Modele Gemini utilise en fallback si OpenAI timeout.",
+    )
+    parser.add_argument(
+        "--gemini-timeout",
+        type=int,
+        default=60,
+        help="Timeout Gemini en secondes.",
+    )
     return parser.parse_args()
 
 
@@ -1547,6 +1924,7 @@ def main() -> int:
 
     zyte_api_key = os.getenv("ZYTE_API_KEY")
     openai_api_key = os.getenv("OPENAI_API_KEY")
+    gemini_api_key = os.getenv("GEMINI_API_KEY") or None
 
     if not zyte_api_key:
         logging.error("Variable ZYTE_API_KEY manquante dans .env ou l'environnement.")
@@ -1611,6 +1989,7 @@ def main() -> int:
                 args=args,
                 zyte_api_key=zyte_api_key,
                 openai_api_key=openai_api_key,
+                gemini_api_key=gemini_api_key,
             )
 
             persist_progress(
@@ -1628,7 +2007,28 @@ def main() -> int:
                 time.sleep(args.sleep)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            future_to_job = {}
+            pending: dict = {}
+
+            def _drain_completed() -> None:
+                done = [f for f in list(pending) if f.done()]
+                for f in done:
+                    idx, u = pending.pop(f)
+                    try:
+                        outcome = f.result()
+                    except Exception:
+                        logging.exception("[%s/%s] Erreur worker pour %s", idx, total, domain_for_log(u))
+                        outcome = ProcessOutcome(empty_result(u))
+                    persist_progress(
+                        outcome=outcome,
+                        results=results,
+                        processed_urls=processed_urls,
+                        url=u,
+                        urls=urls,
+                        output_path=output_path,
+                        args=args,
+                    )
+                    logging.info("[%s/%s] Resultat sauvegarde dans %s", idx, total, output_path)
+
             for job_number, (index, url) in enumerate(jobs, start=1):
                 future = executor.submit(
                     process_url_job,
@@ -1638,19 +2038,21 @@ def main() -> int:
                     args,
                     zyte_api_key,
                     openai_api_key,
+                    gemini_api_key,
                 )
-                future_to_job[future] = (index, url)
+                pending[future] = (index, url)
                 if args.sleep > 0 and job_number < len(jobs):
                     time.sleep(args.sleep)
+                # Persist any completed results immediately so nothing is lost
+                _drain_completed()
 
-            for future in as_completed(future_to_job):
-                index, url = future_to_job[future]
+            for future in as_completed(pending):
+                index, url = pending[future]
                 try:
                     outcome = future.result()
                 except Exception:
                     logging.exception("[%s/%s] Erreur worker pour %s", index, total, domain_for_log(url))
                     outcome = ProcessOutcome(empty_result(url))
-
                 persist_progress(
                     outcome=outcome,
                     results=results,
